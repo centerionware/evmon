@@ -1,9 +1,17 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
+
+# Copy go.mod only
+COPY go.mod ./
+
+# Generate go.sum and download dependencies
+RUN go mod tidy
+
+# Copy the rest of the source code
 COPY . .
+
+# Build the binary (normal build, not forcing static)
 RUN go build -o evmon ./cmd/main.go
 
 # Final stage
