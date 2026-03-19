@@ -13,7 +13,21 @@ import (
 	_ "modernc.org/sqlite"
 	_ "github.com/lib/pq"
 	_ "github.com/go-sql-driver/mysql"
+
 	"centerionware.com/evmon/internal"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+
+	networkingv1 "k8s.io/api/networking/v1"
 )
 
 func main() {
@@ -30,14 +44,8 @@ func main() {
 		}
 		db, err = sql.Open("sqlite", dbURL)
 	case "postgres":
-		if dbURL == "" {
-			log.Fatal("EVMON_DATABASE_URL must be set for Postgres")
-		}
 		db, err = sql.Open("postgres", dbURL)
 	case "mariadb":
-		if dbURL == "" {
-			log.Fatal("EVMON_DATABASE_URL must be set for MariaDB")
-		}
 		db, err = sql.Open("mysql", dbURL)
 	default:
 		log.Fatalf("unsupported EVMON_DB_TYPE: %s", dbType)
@@ -47,8 +55,6 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 	defer db.Close()
 
 	store := internal.NewDBStore(db, dbType)
@@ -61,67 +67,112 @@ func main() {
 		log.Fatalf("failed to create controller: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := controller.SyncIngresses(ctx); err != nil {
-		log.Printf("warning: failed to sync ingresses: %v", err)
-	}
-	if err := controller.SyncCRDs(ctx); err != nil {
-		log.Printf("warning: failed to sync CRDs: %v", err)
+	// --- Kubernetes clients ---
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("failed to get cluster config: %v", err)
 	}
 
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := controller.SyncIngresses(ctx); err != nil {
-					log.Printf("warning: failed to sync ingresses: %v", err)
-				}
-				if err := controller.SyncCRDs(ctx); err != nil {
-					log.Printf("warning: failed to sync CRDs: %v", err)
+	clientset, _ := kubernetes.NewForConfig(config)
+	dynClient, _ := dynamic.NewForConfig(config)
+
+	// --- Ingress informer ---
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+	ingInformer := factory.Networking().V1().Ingresses().Informer()
+
+	ingInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ing := obj.(*networkingv1.Ingress)
+
+			targets := controller.ExtractIngress(ing)
+
+			for _, t := range targets {
+				if _, err := store.GetOrCreateService(t.ServiceID); err != nil {
+					log.Printf("failed to create service: %v", err)
 				}
 			}
-		}
-	}()
+		},
+		DeleteFunc: func(obj interface{}) {
+			ing := obj.(*networkingv1.Ingress)
 
+			ids := controller.ExtractIngressServiceIDs(ing)
+
+			for _, id := range ids {
+				if err := store.DeleteService(id); err != nil {
+					log.Printf("failed to delete service: %v", err)
+				}
+			}
+		},
+	})
+
+	// --- CRD informer ---
+	gvr := schema.GroupVersionResource{
+		Group:    "evmon.centerionware.com",
+		Version:  "v1",
+		Resource: "evmonendpoints",
+	}
+
+	crdInformer := dynamicinformer.NewFilteredDynamicInformer(
+		dynClient,
+		gvr,
+		metav1.NamespaceAll,
+		0,
+		cache.Indexers{},
+		nil,
+	)
+
+	crdInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			u := obj.(*unstructured.Unstructured)
+
+			serviceID, _, _ := unstructured.NestedString(u.Object, "spec", "serviceID")
+
+			if _, err := store.GetOrCreateService(serviceID); err != nil {
+				log.Printf("failed to create service: %v", err)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			u := obj.(*unstructured.Unstructured)
+
+			serviceID, _, _ := unstructured.NestedString(u.Object, "spec", "serviceID")
+
+			if err := store.DeleteService(serviceID); err != nil {
+				log.Printf("failed to delete service: %v", err)
+			}
+		},
+	})
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	go ingInformer.Run(stopCh)
+	go crdInformer.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, ingInformer.HasSynced, crdInformer.HasSynced) {
+		log.Fatal("failed to sync caches")
+	}
+
+	// --- Prober ---
 	prober := internal.NewProber(store, controller)
 	prober.Start()
 	defer prober.Stop()
 
+	// --- API ---
 	api := internal.NewAPI(store)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
 
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
 	}
 
-	stopCh := make(chan os.Signal, 1)
-	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
+	stopSig := make(chan os.Signal, 1)
+	signal.Notify(stopSig, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		log.Printf("HTTP API listening on %s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
+	go server.ListenAndServe()
 
-	<-stopCh
-	log.Println("shutting down Evmon...")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
-	}
+	<-stopSig
+	log.Println("shutting down...")
+	server.Shutdown(context.Background())
 }
