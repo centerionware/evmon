@@ -36,4 +36,5 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ghcr.io/centerionware/evmon:latest
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
+          #,linux/arm64
