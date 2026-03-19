@@ -1,3 +1,4 @@
+// internal/controller.go
 package internal
 
 import (
@@ -125,8 +126,7 @@ func (c *Controller) SyncCRDs(ctx context.Context) error {
 			serviceID = obj.GetName()
 		}
 
-		// Use CRD-defined intervalSeconds if provided; otherwise default to 300s (5min)
-		interval := 300 // seconds
+		interval := 300 // default 5 minutes
 		if val, ok := spec["intervalSeconds"].(int64); ok && val > 0 {
 			interval = int(val)
 		} else if valf, ok := spec["intervalSeconds"].(float64); ok && valf > 0 {
@@ -138,7 +138,7 @@ func (c *Controller) SyncCRDs(ctx context.Context) error {
 			ServiceID: serviceID,
 			URL:       url,
 			Internal:  false,
-			Interval:  time.Duration(interval) * time.Second, // use seconds directly
+			Interval:  time.Duration(interval) * time.Second,
 		}
 	}
 
